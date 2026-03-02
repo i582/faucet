@@ -354,8 +354,13 @@ async fn create_claim(
         ));
     }
 
-    // Remove challenge to prevent reuse
-    state.pow_cache.invalidate(&payload.challenge);
+    // Atomically consume challenge to prevent reuse in concurrent requests.
+    if state.pow_cache.remove(&payload.challenge).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid or expired challenge" })),
+        ));
+    }
 
     state.storage.push(payload).await.map_err(|_| {
         (
