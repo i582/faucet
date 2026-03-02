@@ -13,8 +13,8 @@ use axum_governor::GovernorLayer;
 use client::ToncenterClient;
 use config::Config;
 use lazy_limit::{Duration, RuleConfig, init_rate_limiter};
-use num_bigint::BigUint;
 use moka::sync::Cache;
+use num_bigint::BigUint;
 use rand::RngCore;
 use real::RealIpLayer;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ use tonlib_core::tlb_types::block::message::{CommonMsgInfo, IntMsgInfo, Message}
 use tonlib_core::tlb_types::primitives::either::EitherRef;
 use tonlib_core::tlb_types::tlb::TLB;
 use tower::ServiceBuilder;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use wallet::Wallet;
 
 mod client;
@@ -71,7 +71,8 @@ async fn main() {
     let storage = SqliteStorage::new(&pool);
 
     let wallet = Wallet::new(&config.mnemonic).expect("Failed to create faucet wallet");
-    let client = Arc::new(ToncenterClient::new(&config));
+    let client =
+        Arc::new(ToncenterClient::new(&config).expect("Failed to create Toncenter client"));
 
     let shared_state = AppState {
         storage: storage.clone(),
@@ -162,16 +163,47 @@ async fn send_claim(task: CreateClaim, state: Data<AppState>) -> anyhow::Result<
 
     info!("Processing claim for address: {}", task.address);
 
-    match process_send_tokens(wallet, client, &task.address, state.config.faucet_amount).await {
-        Ok(_) => {
-            info!("Successfully sent claim to {}", task.address);
-            Ok(())
-        }
-        Err(err) => {
-            error!("Failed to send claim to {}: {:#?}", task.address, err);
-            anyhow::bail!("Failed to send claim: {}", err);
+    let max_retries = state.config.worker_max_retries;
+
+    for attempt in 0..=max_retries {
+        match process_send_tokens(wallet, client, &task.address, state.config.faucet_amount).await {
+            Ok(_) => {
+                info!("Successfully sent claim to {}", task.address);
+                return Ok(());
+            }
+            Err(err) => {
+                if attempt < max_retries {
+                    let delay =
+                        exponential_backoff(state.config.worker_retry_base_delay_ms, attempt);
+                    warn!(
+                        address = %task.address,
+                        attempt = attempt + 1,
+                        max_attempts = max_retries + 1,
+                        retry_in_ms = delay.as_millis(),
+                        error = %err,
+                        "Claim send attempt failed, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                error!(
+                    address = %task.address,
+                    attempts = max_retries + 1,
+                    error = %err,
+                    "Failed to send claim after retries"
+                );
+                anyhow::bail!("Failed to send claim: {}", err);
+            }
         }
     }
+
+    unreachable!("send_claim loop should always return");
+}
+
+fn exponential_backoff(base_delay_ms: u64, attempt: u32) -> StdDuration {
+    let multiplier = 1u64 << attempt.min(8);
+    StdDuration::from_millis(base_delay_ms.saturating_mul(multiplier))
 }
 
 async fn process_send_tokens(
@@ -300,7 +332,11 @@ async fn create_claim(
         ));
     }
 
-    if !verify_pow(&payload.challenge, payload.nonce, state.config.pow_difficulty) {
+    if !verify_pow(
+        &payload.challenge,
+        payload.nonce,
+        state.config.pow_difficulty,
+    ) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "Invalid PoW solution" })),
