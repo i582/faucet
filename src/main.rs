@@ -112,8 +112,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(shared_state);
 
-    info!("Listening on 0.0.0.0:{}", port);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+    info!("Listening on 127.0.0.1:{}", port);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .context("Failed to bind TCP listener")?;
     axum::serve(
