@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::Deserialize;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -24,7 +25,7 @@ impl Config {
         Ok(Config {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:./db.sqlite".to_string()),
-            mnemonic: std::env::var("MNEMONIC").expect("MNEMONIC must be set"),
+            mnemonic: std::env::var("MNEMONIC").context("MNEMONIC must be set")?,
             toncenter_api_key: std::env::var("TONCENTER_API_KEY").ok(),
             toncenter_url: std::env::var("TONCENTER_URL")
                 .unwrap_or_else(|_| "https://testnet.toncenter.com".to_string()),

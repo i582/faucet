@@ -1,3 +1,4 @@
+use anyhow::Context;
 use apalis::layers::WorkerBuilderExt;
 use apalis::prelude::json::JsonCodec;
 use apalis::prelude::{Data, TaskSink, WorkerBuilder};
@@ -40,21 +41,21 @@ mod config;
 mod wallet;
 
 #[tokio::main]
-async fn main() {
-    let config = Config::from_env().expect("Failed to load config");
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    let config = Config::from_env().context("Failed to load config")?;
 
     let port = config.port;
 
     let opts = SqliteConnectOptions::from_str(&config.database_url)
-        .expect("Invalid database URL")
+        .context("Invalid database URL")?
         .create_if_missing(true);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(opts)
         .await
-        .expect("Failed to connect to database");
+        .context("Failed to connect to database")?;
 
     init_rate_limiter!(
         default: RuleConfig::new(Duration::seconds(1), 5),
@@ -67,12 +68,12 @@ async fn main() {
 
     SqliteStorage::setup(&pool)
         .await
-        .expect("Failed to setup storage");
+        .context("Failed to setup storage")?;
     let storage = SqliteStorage::new(&pool);
 
-    let wallet = Wallet::new(&config.mnemonic).expect("Failed to create faucet wallet");
+    let wallet = Wallet::new(&config.mnemonic).context("Failed to create faucet wallet")?;
     let client =
-        Arc::new(ToncenterClient::new(&config).expect("Failed to create Toncenter client"));
+        Arc::new(ToncenterClient::new(&config).context("Failed to create Toncenter client")?);
 
     let shared_state = AppState {
         storage: storage.clone(),
@@ -95,7 +96,9 @@ async fn main() {
 
     tokio::spawn(async move {
         info!("Starting claim worker");
-        worker.run().await.expect("Worker failed");
+        if let Err(err) = worker.run().await {
+            error!(error = %err, "Worker failed");
+        }
     });
 
     let app = Router::new()
@@ -112,29 +115,37 @@ async fn main() {
     info!("Listening on 0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
-        .unwrap();
+        .context("Failed to bind TCP listener")?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .unwrap();
+    .context("HTTP server exited with error")?;
+
+    Ok(())
 }
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            error!(error = %err, "failed to install Ctrl+C handler");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                error!(error = %err, "failed to install signal handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
